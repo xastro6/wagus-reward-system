@@ -1,22 +1,20 @@
-import { 
-    Connection, 
-    PublicKey, 
-    Keypair, 
-    Transaction, 
-    TransactionInstruction, 
+import {
+    Connection,
+    PublicKey,
+    Keypair,
+    Transaction,
+    TransactionInstruction,
     sendAndConfirmTransaction,
-    SystemProgram
+    SystemProgram,
 } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, getOrCreateAssociatedTokenAccount, getMint, getMinimumBalanceForRentExemptMint, MINT_SIZE } from '@solana/spl-token';
 import { readFileSync } from 'fs';
+import { serialize } from 'borsh';
 
-// Connection configuration with commitment level
-const connection = new Connection('https://api.devnet.solana.com', {
-    commitment: 'confirmed',
-    confirmTransactionInitialTimeout: 60000 // 60 seconds timeout
-});
+// Connection configuration
+const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
-// Load keypair with error handling
+// Load payer keypair
 let payer;
 try {
     payer = Keypair.fromSecretKey(
@@ -27,22 +25,12 @@ try {
     process.exit(1);
 }
 
-// Constants and Public Keys
-const PROGRAM_ID = new PublicKey('2ga161fxHesc8YATYz2CconNkTSpCJVABrjbBKGtRYGF');
-const [rewardAccountPda, rewardBump] = await PublicKey.findProgramAddress(
-    [Buffer.from("reward")],
-    PROGRAM_ID
-);
-const ACCOUNTS = {
-    reward: rewardAccountPda,
-    userToken: new PublicKey('6UR1TvXTocdnjCWewwq7LiZfR9gnp8wS4R94pSsYhwja'),
-    vaultToken: new PublicKey('3Jz4UFKq6NBke45J2en3UD733xpHkAekmW8Cn5Tsx4uA'),
-    mint: new PublicKey('Bqw2nob1NpDCnEBEtPqnUVoDqW97JRUK8js5VjyC5Q4n'),
-    tokenProgram: TOKEN_PROGRAM_ID
-};
+// Constants
+const PROGRAM_ID = new PublicKey("2ga161fxHesc8YATYz2CconNkTSpCJVABrjbBKGtRYGF");
+let MINT_ADDRESS; // Will be set dynamically after creation
 
-// Function to send transactions
-async function sendTransaction(instructionData) {
+// Function to send transaction
+async function sendTransaction(instruction) {
     try {
         const transaction = new Transaction();
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
@@ -50,34 +38,9 @@ async function sendTransaction(instructionData) {
         transaction.feePayer = payer.publicKey;
         transaction.recentBlockhash = blockhash;
         transaction.lastValidBlockHeight = lastValidBlockHeight;
-        transaction.add(instructionData);
+        transaction.add(instruction);
 
-        // Log instruction keys for debugging
-        console.log('Instruction keys:');
-        instructionData.keys.forEach((key, i) => {
-            console.log(`Instruction key ${i}: ${key.pubkey.toBase58()} isSigner: ${key.isSigner}`);
-        });
-        
-        // Sign transaction
-        transaction.sign(payer);
-        console.log('Transaction signatures:', transaction.signatures.map(s => s.publicKey.toBase58()));
-
-        // Send and confirm with proper error handling and timeout
-        const signature = await connection.sendRawTransaction(transaction.serialize(), {
-            skipPreflight: false,
-            preflightCommitment: 'confirmed',
-        });
-
-        const confirmation = await connection.confirmTransaction({
-            signature,
-            blockhash,
-            lastValidBlockHeight,
-        });
-
-        if (confirmation.value.err) {
-            throw new Error(`Transaction failed: ${confirmation.value.err}`);
-        }
-
+        const signature = await sendAndConfirmTransaction(connection, transaction, [payer]);
         console.log('Transaction confirmed:', signature);
         return signature;
     } catch (error) {
@@ -86,86 +49,135 @@ async function sendTransaction(instructionData) {
     }
 }
 
-// Initialize reward account
-async function initRewardAccount() {
+// Create a new mint with PDA as authority
+async function createTokenMintIfNeeded() {
     try {
-        const instructionData = Buffer.alloc(1);
-        instructionData.writeUInt8(0, 0); // Init variant
+        if (MINT_ADDRESS) {
+            await getMint(connection, MINT_ADDRESS);
+            console.log('Mint already exists:', MINT_ADDRESS.toBase58());
+        } else {
+            console.log('Mint does not exist, creating a new one with PDA authority...');
+            const mintKeypair = Keypair.generate();
+            MINT_ADDRESS = mintKeypair.publicKey;
 
-        const instruction = new TransactionInstruction({
-            programId: PROGRAM_ID,
-            data: instructionData,
-            keys: [
-                { pubkey: payer.publicKey, isSigner: true, isWritable: true }, // Signer (payer)
-                { pubkey: ACCOUNTS.reward, isSigner: false, isWritable: true }, // Reward account (PDA)
-                { pubkey: ACCOUNTS.userToken, isSigner: false, isWritable: false },
-                { pubkey: ACCOUNTS.vaultToken, isSigner: false, isWritable: false },
-                { pubkey: ACCOUNTS.mint, isSigner: false, isWritable: false },
-                { pubkey: ACCOUNTS.tokenProgram, isSigner: false, isWritable: false },
-                { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System Program
-            ],
-        });
+            const [mintAuthority, bump] = PublicKey.findProgramAddressSync(
+                [Buffer.from("mint_auth")],
+                PROGRAM_ID
+            );
 
-        return await sendTransaction(instruction);
+            // Log values for debugging
+            console.log('Mint Address:', MINT_ADDRESS.toBase58());
+            console.log('Mint Authority (PDA):', mintAuthority.toBase58());
+            console.log('Program ID:', PROGRAM_ID.toBase58());
+            console.log('TOKEN_PROGRAM_ID:', TOKEN_PROGRAM_ID.toBase58());
+
+            const lamports = await getMinimumBalanceForRentExemptMint(connection);
+
+            // Manually construct InitializeMint instruction data
+            const decimals = 9;
+            const instructionData = Buffer.alloc(1 + 1 + 32 + 1 + 32); // Instruction ID + Decimals + Mint Authority + Freeze Option + Freeze Authority
+            let offset = 0;
+            instructionData.writeUInt8(0, offset); // Instruction ID: InitializeMint (0)
+            offset += 1;
+            instructionData.writeUInt8(decimals, offset); // Decimals
+            offset += 1;
+            instructionData.fill(mintAuthority.toBytes(), offset, offset + 32); // Mint Authority (PDA)
+            offset += 32;
+            instructionData.writeUInt8(1, offset); // Freeze Authority Option: Present (1)
+            offset += 1;
+            instructionData.fill(mintAuthority.toBytes(), offset, offset + 32); // Freeze Authority (same PDA)
+
+            const transaction = new Transaction().add(
+                SystemProgram.createAccount({
+                    fromPubkey: payer.publicKey,
+                    newAccountPubkey: MINT_ADDRESS,
+                    space: MINT_SIZE,
+                    lamports,
+                    programId: TOKEN_PROGRAM_ID,
+                }),
+                new TransactionInstruction({
+                    keys: [
+                        { pubkey: MINT_ADDRESS, isSigner: false, isWritable: true }, // Mint account
+                        { pubkey: new PublicKey("SysvarRent111111111111111111111111111111111"), isSigner: false, isWritable: false }, // Rent sysvar
+                    ],
+                    programId: TOKEN_PROGRAM_ID,
+                    data: instructionData,
+                })
+            );
+
+            const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.lastValidBlockHeight = lastValidBlockHeight;
+            transaction.feePayer = payer.publicKey;
+
+            const signature = await sendAndConfirmTransaction(connection, transaction, [payer, mintKeypair]);
+            console.log('New mint created with PDA authority:', MINT_ADDRESS.toBase58(), 'Tx:', signature);
+        }
     } catch (error) {
-        console.error('Error initializing reward account:', error);
+        console.error('Error creating mint:', error);
         throw error;
     }
+    return MINT_ADDRESS;
 }
 
-// Earn points
-async function earnPoints(points = 100) {
+// Mint and send tokens
+async function mintAndSendTokens(userWallet, amount = 1000n) {
     try {
-        const instructionData = Buffer.alloc(5);
-        instructionData.writeUInt8(1, 0); // Earn variant
-        instructionData.writeUInt32LE(points, 1);
+        console.log(`Attempting to get or create ATA for mint: ${MINT_ADDRESS.toBase58()} and owner: ${userWallet.toBase58()}`);
+        
+        // Verify the mint exists
+        const mintInfo = await getMint(connection, MINT_ADDRESS);
+        console.log('Mint account verified. Decimals:', mintInfo.decimals);
 
+        // Get or create user's associated token account
+        const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+            connection,
+            payer,
+            MINT_ADDRESS,
+            userWallet,
+            false,
+            'confirmed'
+        );
+        const userTokenAddress = userTokenAccount.address;
+        console.log('User ATA:', userTokenAddress.toBase58());
+
+        // Use the PDA as the mint authority
+        const [mintAuthority] = PublicKey.findProgramAddressSync(
+            [Buffer.from("mint_auth")],
+            PROGRAM_ID
+        );
+        console.log('Mint Authority (PDA):', mintAuthority.toBase58());
+
+        // Define the instruction data correctly
+        const instructionData = Buffer.alloc(9); // 1 byte for enum discriminant + 8 bytes for u64
+        instructionData.writeUInt8(0, 0); // Discriminant for MintToken (assuming 0)
+        instructionData.writeBigUInt64LE(BigInt(amount), 1); // Write amount as little-endian u64
+
+        // Log the instruction data for debugging
+        console.log('Instruction Data (hex):', instructionData.toString('hex'));
+
+        // Verify the data is not empty
+        if (instructionData.length === 0) {
+            throw new Error('Instruction data is empty!');
+        }
+
+        // Create program instruction
         const instruction = new TransactionInstruction({
+            keys: [
+                { pubkey: payer.publicKey, isSigner: true, isWritable: false },         // Signer
+                { pubkey: MINT_ADDRESS, isSigner: false, isWritable: true },            // Mint account
+                { pubkey: userTokenAddress, isSigner: false, isWritable: true },        // User token account
+                { pubkey: mintAuthority, isSigner: false, isWritable: false },          // Mint authority (PDA)
+                { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },       // Token program
+            ],
             programId: PROGRAM_ID,
             data: instructionData,
-            keys: [
-                { pubkey: payer.publicKey, isSigner: true, isWritable: false },
-                { pubkey: ACCOUNTS.reward, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.userToken, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.vaultToken, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.mint, isSigner: false, isWritable: false },
-                { pubkey: ACCOUNTS.tokenProgram, isSigner: false, isWritable: false },
-                { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-            ],
         });
 
+        // Send the transaction
         return await sendTransaction(instruction);
     } catch (error) {
-        console.error('Error earning points:', error);
-        throw error;
-    }
-}
-
-// Claim reward
-async function claimReward(requiredPoints = 50, amount = 2000n) {
-    try {
-        const instructionData = Buffer.alloc(13);
-        instructionData.writeUInt8(2, 0); // Claim variant
-        instructionData.writeUInt32LE(requiredPoints, 1);
-        instructionData.writeBigUInt64LE(amount, 5);
-
-        const instruction = new TransactionInstruction({
-            programId: PROGRAM_ID,
-            data: instructionData,
-            keys: [
-                { pubkey: payer.publicKey, isSigner: true, isWritable: false },
-                { pubkey: ACCOUNTS.reward, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.userToken, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.vaultToken, isSigner: false, isWritable: true },
-                { pubkey: ACCOUNTS.mint, isSigner: false, isWritable: false },
-                { pubkey: ACCOUNTS.tokenProgram, isSigner: false, isWritable: false },
-                { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-            ],
-        });
-
-        return await sendTransaction(instruction);
-    } catch (error) {
-        console.error('Error claiming reward:', error);
+        console.error('Error minting and sending tokens:', error);
         throw error;
     }
 }
@@ -173,16 +185,10 @@ async function claimReward(requiredPoints = 50, amount = 2000n) {
 // Check payer balance
 async function checkPayerBalance() {
     try {
-        const [balance, accountInfo] = await Promise.all([
-            connection.getBalance(payer.publicKey),
-            connection.getAccountInfo(payer.publicKey)
-        ]);
-
+        const balance = await connection.getBalance(payer.publicKey);
         console.log(`Payer Public Key: ${payer.publicKey.toBase58()}`);
         console.log(`Balance: ${balance / 1e9} SOL`);
-        console.log(`Account exists: ${accountInfo !== null}`);
-
-        return { balance, accountInfo };
+        return balance;
     } catch (error) {
         console.error('Error checking balance:', error);
         throw error;
@@ -192,33 +198,26 @@ async function checkPayerBalance() {
 // Main execution
 async function main() {
     try {
-        console.log('Starting reward system interactions...');
+        console.log('Starting mint and send operation...');
         
-        // Check balance before operations
         await checkPayerBalance();
+
+        // Create or verify the mint
+        await createTokenMintIfNeeded();
+
+        const userWallet = new PublicKey("nbmoqeQTPMzjU4rXs9XDPGaWkGtanjYxtXx7RWi4T9n");
+        const mintTxSignature = await mintAndSendTokens(userWallet, 1000n);
+        console.log(`Tokens minted and sent to user wallet with tx signature: ${mintTxSignature}`);
         
-        // Initialize the reward account (creation happens in the program)
-        await initRewardAccount();
-        
-        // Execute operations
-        await earnPoints();
-        // await claimReward();
-        
-        console.log('Operations completed successfully');
+        console.log('Operation completed successfully');
     } catch (error) {
         console.error('Main execution failed:', error);
         process.exit(1);
     }
 }
 
-// Execute with proper error handling
 if (import.meta.url === new URL(import.meta.url).href) {
     main().catch(console.error);
 }
 
-export {
-    initRewardAccount,
-    earnPoints,
-    claimReward,
-    checkPayerBalance
-};
+export { mintAndSendTokens, checkPayerBalance };
